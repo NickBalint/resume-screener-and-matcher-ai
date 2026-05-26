@@ -1,9 +1,14 @@
 import re
-from io import StringIO
+import shutil
+from io import BytesIO
 from typing import Dict, List, Tuple
 
+import fitz
 import pandas as pd
+import pytesseract
 import streamlit as st
+from PIL import Image
+from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -35,6 +40,16 @@ ACTION_VERBS = [
     "built", "created", "developed", "designed", "implemented", "analyzed", "automated",
     "improved", "optimized", "deployed", "trained", "evaluated", "managed", "led"
 ]
+
+OCR_LANGUAGE_OPTIONS: Dict[str, str] = {
+    "English": "eng",
+    "Spanish": "spa",
+    "French": "fra",
+    "German": "deu",
+    "Italian": "ita",
+    "Portuguese": "por",
+    "Dutch": "nld",
+}
 
 
 def clean_text(text: str) -> str:
@@ -104,15 +119,53 @@ def resume_feedback(resume_text: str, best_role: str) -> List[str]:
     return feedback
 
 
-def read_uploaded_file(uploaded_file) -> str:
+def extract_pdf_text(pdf_bytes: bytes, ocr_lang_codes: List[str]) -> Tuple[str, str]:
+    try:
+        reader = PdfReader(BytesIO(pdf_bytes))
+        pages_text = []
+        for page in reader.pages:
+            pages_text.append(page.extract_text() or "")
+        direct_text = "\n".join(pages_text).strip()
+        if direct_text:
+            return direct_text, ""
+    except Exception:
+        pass
+
+    if shutil.which("tesseract") is None:
+        return "", "No selectable text was found in this PDF. OCR fallback requires Tesseract (macOS: brew install tesseract)."
+
+    try:
+        selected_langs = sorted(set(ocr_lang_codes))
+        lang_arg = "+".join(selected_langs) if selected_langs else "eng"
+        ocr_pages = []
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
+            for page in document:
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
+                image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+                ocr_pages.append(pytesseract.image_to_string(image, lang=lang_arg))
+
+        ocr_text = "\n".join(ocr_pages).strip()
+        if ocr_text:
+            return ocr_text, "No selectable text was found, so OCR was used to read this PDF."
+        return "", "No selectable text was found and OCR could not detect readable text."
+    except Exception as exc:
+        message = str(exc)
+        if "Failed loading language" in message or "Error opening data file" in message:
+            return "", "OCR language data is missing for one or more selected languages. Install additional packs with: brew install tesseract-lang"
+        return "", "No selectable text was found and OCR failed while processing this PDF."
+
+
+def read_uploaded_file(uploaded_file, ocr_lang_codes: List[str]) -> Tuple[str, str]:
     if uploaded_file is None:
-        return ""
+        return "", ""
     if uploaded_file.type == "text/plain":
-        return uploaded_file.read().decode("utf-8", errors="ignore")
+        return uploaded_file.read().decode("utf-8", errors="ignore"), ""
     if uploaded_file.type == "text/csv":
         df = pd.read_csv(uploaded_file)
-        return " ".join(df.astype(str).fillna("").values.flatten())
-    return uploaded_file.read().decode("utf-8", errors="ignore")
+        return " ".join(df.astype(str).fillna("").values.flatten()), ""
+    if uploaded_file.type == "application/pdf":
+        return extract_pdf_text(uploaded_file.read(), ocr_lang_codes)
+    return uploaded_file.read().decode("utf-8", errors="ignore"), ""
 
 
 st.set_page_config(page_title="AI Resume Screener + Job Matcher", page_icon="📄", layout="wide")
@@ -123,9 +176,20 @@ with st.sidebar:
     st.header("Project Info")
     st.write("ML used: TF-IDF vectorization + cosine similarity + rule-based skill extraction.")
     st.write("Group extension ideas: PDF parsing, live job listings, user accounts, BERT embeddings, dashboards.")
+    selected_ocr_languages = st.multiselect(
+        "OCR languages for scanned PDFs",
+        options=list(OCR_LANGUAGE_OPTIONS.keys()),
+        default=["English"],
+        help="Use one or more languages when OCR is needed for image-based PDFs.",
+    )
 
-uploaded_file = st.file_uploader("Upload a resume text file or CSV", type=["txt", "csv"])
-text_from_file = read_uploaded_file(uploaded_file)
+ocr_lang_codes = [OCR_LANGUAGE_OPTIONS[name] for name in selected_ocr_languages]
+
+uploaded_file = st.file_uploader("Upload a resume file (TXT, CSV, or PDF)", type=["txt", "csv", "pdf"])
+text_from_file, upload_notice = read_uploaded_file(uploaded_file, ocr_lang_codes)
+
+if upload_notice:
+    st.info(upload_notice)
 
 resume_text = st.text_area(
     "Resume text",
