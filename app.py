@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple
 import fitz
 import pandas as pd
 import pytesseract
+import requests
 import streamlit as st
 from PIL import Image
 from pypdf import PdfReader
@@ -50,6 +51,11 @@ OCR_LANGUAGE_OPTIONS: Dict[str, str] = {
     "Portuguese": "por",
     "Dutch": "nld",
 }
+
+REMOTIVE_API_URL = "https://remotive.com/api/remote-jobs"
+ARBEITNOW_API_URL = "https://www.arbeitnow.com/api/job-board-api"
+REMOTEOK_API_URL = "https://remoteok.com/api"
+HN_ALGOLIA_JOBS_API_URL = "https://hn.algolia.com/api/v1/search_by_date"
 
 
 def clean_text(text: str) -> str:
@@ -168,7 +174,315 @@ def read_uploaded_file(uploaded_file, ocr_lang_codes: List[str]) -> Tuple[str, s
     return uploaded_file.read().decode("utf-8", errors="ignore"), ""
 
 
+def strip_html(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text)).strip()
+
+
+def fetch_remotive_jobs(search_query: str, limit: int = 20) -> Tuple[List[Dict[str, str]], str]:
+    try:
+        response = requests.get(
+            REMOTIVE_API_URL,
+            params={"search": search_query},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return [], "Unable to fetch live jobs right now from Remotive API. Please try again in a moment."
+
+    jobs = payload.get("jobs", []) if isinstance(payload, dict) else []
+    normalized_jobs: List[Dict[str, str]] = []
+    for job in jobs[:limit]:
+        normalized_jobs.append(
+            {
+                "title": str(job.get("title", "")).strip(),
+                "company": str(job.get("company_name", "")).strip(),
+                "location": str(job.get("candidate_required_location", "Remote")).strip(),
+                "published": str(job.get("publication_date", "")).strip(),
+                "apply_url": str(job.get("url", "")).strip(),
+                "description": strip_html(str(job.get("description", ""))),
+                "source": "Remotive",
+            }
+        )
+
+    if not normalized_jobs:
+        return [], "No live jobs were found for that role right now."
+    return normalized_jobs, ""
+
+
+def fetch_arbeitnow_jobs(search_query: str, limit: int = 20) -> Tuple[List[Dict[str, str]], str]:
+    try:
+        response = requests.get(ARBEITNOW_API_URL, timeout=15)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return [], ""
+
+    jobs = payload.get("data", []) if isinstance(payload, dict) else []
+    query_tokens = [token for token in clean_text(search_query).split() if token]
+
+    normalized_jobs: List[Dict[str, str]] = []
+    for job in jobs:
+        title = str(job.get("title", "")).strip()
+        description = strip_html(str(job.get("description", "")))
+        searchable = clean_text(f"{title} {description}")
+        if query_tokens and not any(token in searchable for token in query_tokens):
+            continue
+
+        normalized_jobs.append(
+            {
+                "title": title,
+                "company": str(job.get("company_name", "")).strip(),
+                "location": str(job.get("location", "Remote")).strip(),
+                "published": str(job.get("created_at", "")).strip(),
+                "apply_url": str(job.get("url", "")).strip(),
+                "description": description,
+                "source": "Arbeitnow",
+            }
+        )
+
+        if len(normalized_jobs) >= limit:
+            break
+
+    return normalized_jobs, ""
+
+
+def fetch_jobs_from_public_apis(search_query: str, limit: int = 20) -> Tuple[List[Dict[str, str]], str]:
+    remotive_jobs, remotive_error = fetch_remotive_jobs(search_query, limit=limit)
+    arbeitnow_jobs, _ = fetch_arbeitnow_jobs(search_query, limit=limit)
+    remoteok_jobs, _ = fetch_remoteok_jobs(search_query, limit=limit)
+    hackernews_jobs, _ = fetch_hackernews_jobs(search_query, limit=limit)
+
+    combined = remotive_jobs + arbeitnow_jobs + remoteok_jobs + hackernews_jobs
+    deduped: List[Dict[str, str]] = []
+    seen_urls = set()
+    for job in combined:
+        apply_url = job.get("apply_url", "")
+        if not apply_url or apply_url in seen_urls:
+            continue
+        seen_urls.add(apply_url)
+        deduped.append(job)
+        if len(deduped) >= limit:
+            break
+
+    if deduped:
+        return deduped, ""
+    if remotive_error:
+        return [], remotive_error
+    return [], "No live jobs were found from currently available public APIs."
+
+
+def fetch_remoteok_jobs(search_query: str, limit: int = 20) -> Tuple[List[Dict[str, str]], str]:
+    try:
+        response = requests.get(
+            REMOTEOK_API_URL,
+            headers={"User-Agent": "resume-screener-ai/1.0"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return [], ""
+
+    if not isinstance(payload, list):
+        return [], ""
+
+    query_tokens = [token for token in clean_text(search_query).split() if token]
+    normalized_jobs: List[Dict[str, str]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+
+        title = str(item.get("position", "")).strip()
+        company = str(item.get("company", "")).strip()
+        description = strip_html(str(item.get("description", "")))
+        searchable = clean_text(f"{title} {description}")
+        if query_tokens and not any(token in searchable for token in query_tokens):
+            continue
+
+        apply_url = str(item.get("url", "")).strip()
+        if not apply_url:
+            continue
+
+        normalized_jobs.append(
+            {
+                "title": title,
+                "company": company,
+                "location": str(item.get("location", "Remote")).strip() or "Remote",
+                "published": str(item.get("date", "")).strip(),
+                "apply_url": apply_url,
+                "description": description,
+                "source": "RemoteOK",
+            }
+        )
+
+        if len(normalized_jobs) >= limit:
+            break
+
+    return normalized_jobs, ""
+
+
+def fetch_hackernews_jobs(search_query: str, limit: int = 20) -> Tuple[List[Dict[str, str]], str]:
+    try:
+        response = requests.get(
+            HN_ALGOLIA_JOBS_API_URL,
+            params={"tags": "job,story", "query": search_query, "hitsPerPage": str(limit * 2)},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return [], ""
+
+    hits = payload.get("hits", []) if isinstance(payload, dict) else []
+    normalized_jobs: List[Dict[str, str]] = []
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+
+        title = str(hit.get("title") or hit.get("story_title") or "").strip()
+        if not title:
+            continue
+
+        apply_url = str(hit.get("url") or hit.get("story_url") or "").strip()
+        if not apply_url:
+            hn_id = str(hit.get("objectID", "")).strip()
+            if hn_id:
+                apply_url = f"https://news.ycombinator.com/item?id={hn_id}"
+            else:
+                continue
+
+        created_at = str(hit.get("created_at", "")).strip()
+        normalized_jobs.append(
+            {
+                "title": title,
+                "company": "Hacker News Post",
+                "location": "Remote/Unknown",
+                "published": created_at,
+                "apply_url": apply_url,
+                "description": title,
+                "source": "Hacker News",
+            }
+        )
+
+        if len(normalized_jobs) >= limit:
+            break
+
+    return normalized_jobs, ""
+
+
+def rank_live_jobs(resume_text: str, jobs: List[Dict[str, str]]) -> pd.DataFrame:
+    if not jobs:
+        return pd.DataFrame()
+
+    all_skills = sorted({skill for role in JOB_ROLES.values() for skill in role["skills"]})
+    resume_skills = set(extract_skills(resume_text, all_skills))
+
+    role_docs = []
+    for job in jobs:
+        description = job.get("description", "")
+        title = job.get("title", "")
+        role_docs.append(clean_text(f"{description} {title}"))
+
+    docs = [clean_text(resume_text)] + role_docs
+    try:
+        vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
+        matrix = vectorizer.fit_transform(docs)
+        similarities = cosine_similarity(matrix[0:1], matrix[1:]).flatten()
+    except ValueError:
+        # Fallback when all docs collapse to empty vocabulary after cleaning.
+        similarities = [0.0] * len(jobs)
+
+    rows = []
+    for job, similarity in zip(jobs, similarities):
+        job_skill_targets = set(extract_skills(job.get("description", ""), all_skills))
+        if job_skill_targets:
+            matched = sorted(resume_skills.intersection(job_skill_targets))
+            skill_score = len(matched) / len(job_skill_targets)
+            matched_preview = ", ".join(matched[:6]) if matched else "None"
+        else:
+            skill_score = 0.0
+            matched_preview = "No common tracked skills found"
+
+        final_score = round((0.7 * similarity + 0.3 * skill_score) * 100, 1)
+        rows.append(
+            {
+                "Match Score": final_score,
+                "Job Title": job.get("title", "Unknown Role"),
+                "Company": job.get("company", "Unknown Company"),
+                "Location": job.get("location", "Remote"),
+                "Matched Skills": matched_preview,
+                "Source": job.get("source", "API"),
+                "Apply Link": job.get("apply_url", ""),
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("Match Score", ascending=False).reset_index(drop=True)
+
+
+def source_counts_text(jobs: List[Dict[str, str]]) -> str:
+    if not jobs:
+        return ""
+    counts: Dict[str, int] = {}
+    for job in jobs:
+        source = str(job.get("source", "Unknown")).strip() or "Unknown"
+        counts[source] = counts.get(source, 0) + 1
+    parts = [f"{source}: {count}" for source, count in sorted(counts.items())]
+    return " | ".join(parts)
+
+
 st.set_page_config(page_title="AI Resume Screener + Job Matcher", page_icon="📄", layout="wide")
+st.markdown(
+    """
+    <style>
+    :root {
+        --accent-blue: #2563eb;
+        --accent-blue-dark: #1d4ed8;
+        --accent-blue-soft: #dbeafe;
+        --accent-blue-border: #93c5fd;
+    }
+
+    .stButton > button[kind="primary"] {
+        background: var(--accent-blue) !important;
+        border-color: var(--accent-blue) !important;
+    }
+
+    .stButton > button[kind="primary"]:hover {
+        background: var(--accent-blue-dark) !important;
+        border-color: var(--accent-blue-dark) !important;
+    }
+
+    /* Blue style for OCR language selector */
+    [data-testid="stSidebar"] div[data-baseweb="select"] > div {
+        border-color: var(--accent-blue-border);
+    }
+
+    [data-testid="stSidebar"] .stMultiSelect div[data-baseweb="tag"] {
+        background-color: var(--accent-blue-soft) !important;
+        color: #1e3a8a !important;
+        border-color: var(--accent-blue-border) !important;
+    }
+
+    [data-testid="stSidebar"] .stMultiSelect div[data-baseweb="tag"] * {
+        color: #1e3a8a !important;
+        fill: #1e3a8a !important;
+    }
+
+    [data-testid="stSidebar"] .stMultiSelect div[data-baseweb="select"] > div:focus-within {
+        border-color: var(--accent-blue) !important;
+        box-shadow: 0 0 0 1px var(--accent-blue) !important;
+    }
+
+    [data-testid="stSidebar"] div[data-baseweb="select"] input {
+        caret-color: var(--accent-blue);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("📄 AI Resume Screener + Job Matcher")
 st.write("Paste or upload resume text to predict suitable job roles and get improvement suggestions.")
 
@@ -186,6 +500,7 @@ with st.sidebar:
 ocr_lang_codes = [OCR_LANGUAGE_OPTIONS[name] for name in selected_ocr_languages]
 
 uploaded_file = st.file_uploader("Upload a resume file (TXT, CSV, or PDF)", type=["txt", "csv", "pdf"])
+
 text_from_file, upload_notice = read_uploaded_file(uploaded_file, ocr_lang_codes)
 
 if upload_notice:
@@ -198,26 +513,147 @@ resume_text = st.text_area(
     placeholder="Paste your resume here..."
 )
 
+if "analysis_ready" not in st.session_state:
+    st.session_state["analysis_ready"] = False
+
 if st.button("Analyze Resume", type="primary"):
     if not resume_text.strip():
         st.warning("Please paste or upload resume text first.")
+        st.session_state["analysis_ready"] = False
     else:
         results = score_resume(resume_text)
         best_role = results.iloc[0]["Job Role"]
-
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            st.metric("Best Match", best_role)
-            st.metric("Top Score", f"{results.iloc[0]['Match Score']}%")
-        with col2:
-            st.subheader("Job Match Results")
-            st.dataframe(results, use_container_width=True, hide_index=True)
-
-        st.subheader("Improvement Suggestions")
-        for item in resume_feedback(resume_text, best_role):
-            st.write(f"- {item}")
-
-        st.subheader("Detected Skills Across All Roles")
+        suggestions = resume_feedback(resume_text, best_role)
         all_skills = [skill for role in JOB_ROLES.values() for skill in role["skills"]]
-        detected = extract_skills(resume_text, all_skills)
-        st.write(", ".join(detected) if detected else "No listed skills detected yet.")
+        detected_skills = extract_skills(resume_text, all_skills)
+
+        with st.spinner("Fetching current job listings and ranking best applications..."):
+            live_jobs, jobs_error = fetch_jobs_from_public_apis(best_role, limit=25)
+
+        ranked_jobs = pd.DataFrame()
+        if not jobs_error:
+            ranked_jobs = rank_live_jobs(resume_text, live_jobs)
+
+        st.session_state["analysis_ready"] = True
+        st.session_state["analysis_results"] = results
+        st.session_state["analysis_best_role"] = best_role
+        st.session_state["analysis_suggestions"] = suggestions
+        st.session_state["analysis_detected_skills"] = detected_skills
+        st.session_state["analysis_live_jobs"] = live_jobs
+        st.session_state["analysis_jobs_error"] = jobs_error
+        st.session_state["analysis_ranked_jobs"] = ranked_jobs
+
+if st.session_state.get("analysis_ready", False):
+    results = st.session_state["analysis_results"]
+    best_role = st.session_state["analysis_best_role"]
+    suggestions = st.session_state["analysis_suggestions"]
+    detected_skills = st.session_state["analysis_detected_skills"]
+    live_jobs = st.session_state["analysis_live_jobs"]
+    jobs_error = st.session_state["analysis_jobs_error"]
+    ranked_jobs = st.session_state["analysis_ranked_jobs"]
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        st.metric("Best Match", best_role)
+        st.metric("Top Score", f"{results.iloc[0]['Match Score']}%")
+    with col2:
+        st.subheader("Job Match Results")
+        st.dataframe(results, width="stretch", hide_index=True)
+
+    st.subheader("Improvement Suggestions")
+    for item in suggestions:
+        st.write(f"- {item}")
+
+    st.subheader("Detected Skills Across All Roles")
+    st.write(", ".join(detected_skills) if detected_skills else "No listed skills detected yet.")
+
+    st.subheader("Live Job Recommendations")
+    st.caption("Pulled from public APIs: Remotive, Arbeitnow, RemoteOK, and Hacker News Jobs")
+
+    if jobs_error:
+        st.info(jobs_error)
+    else:
+        st.caption(f"Sources loaded -> {source_counts_text(live_jobs)}")
+        if ranked_jobs.empty:
+            st.info("No ranked jobs available yet.")
+        else:
+            filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
+
+            with filter_col1:
+                location_options = ["All"] + sorted(ranked_jobs["Location"].dropna().astype(str).unique().tolist())
+                selected_location = st.selectbox(
+                    "Location",
+                    options=location_options,
+                    index=0,
+                    key="live_jobs_location_filter",
+                )
+
+            with filter_col2:
+                remote_only = st.checkbox(
+                    "Remote only",
+                    value=False,
+                    key="live_jobs_remote_only",
+                )
+
+            with filter_col3:
+                min_score = st.slider(
+                    "Minimum score",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=40.0,
+                    step=1.0,
+                    key="live_jobs_min_score",
+                )
+
+            with filter_col4:
+                sort_option = st.selectbox(
+                    "Sort by",
+                    options=[
+                        "Match Score (high to low)",
+                        "Match Score (low to high)",
+                        "Company (A-Z)",
+                        "Location (A-Z)",
+                        "Source (A-Z)",
+                    ],
+                    index=0,
+                    key="live_jobs_sort",
+                )
+
+            filtered_jobs = ranked_jobs.copy()
+            if selected_location != "All":
+                filtered_jobs = filtered_jobs[filtered_jobs["Location"] == selected_location]
+
+            if remote_only:
+                filtered_jobs = filtered_jobs[
+                    filtered_jobs["Location"].str.contains("remote", case=False, na=False)
+                ]
+
+            filtered_jobs = filtered_jobs[filtered_jobs["Match Score"] >= min_score]
+
+            sort_map = {
+                "Match Score (high to low)": ("Match Score", False),
+                "Match Score (low to high)": ("Match Score", True),
+                "Company (A-Z)": ("Company", True),
+                "Location (A-Z)": ("Location", True),
+                "Source (A-Z)": ("Source", True),
+            }
+            sort_col, ascending = sort_map[sort_option]
+            filtered_jobs = filtered_jobs.sort_values(sort_col, ascending=ascending).reset_index(drop=True)
+
+            st.caption(f"Showing {len(filtered_jobs)} of {len(ranked_jobs)} jobs")
+
+            if filtered_jobs.empty:
+                st.info("No jobs match the selected filters. Try relaxing the filters.")
+            else:
+                st.dataframe(
+                    filtered_jobs,
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "Apply Link": st.column_config.LinkColumn(
+                            "Apply Link",
+                            help="Open the direct job application page",
+                            display_text="Apply",
+                        ),
+                    },
+                )
