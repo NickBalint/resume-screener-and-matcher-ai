@@ -1,7 +1,8 @@
 import re
 import shutil
+import math
 from io import BytesIO
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, cast
 
 import fitz
 import pandas as pd
@@ -11,6 +12,7 @@ import streamlit as st
 from PIL import Image
 from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics.pairwise import cosine_similarity
 
 
@@ -74,6 +76,34 @@ def extract_skills(resume_text: str, all_skills: List[str]) -> List[str]:
     return found
 
 
+@st.cache_resource(show_spinner=False)
+def get_role_classifier() -> Tuple[TfidfVectorizer, LogisticRegression]:
+    train_texts: List[str] = []
+    train_labels: List[str] = []
+
+    for role, config in JOB_ROLES.items():
+        description = str(config["description"])
+        skills = [str(skill) for skill in cast(List[str], config["skills"])]
+
+        templates = [
+            description,
+            f"{role} role focused on {', '.join(skills)}.",
+            f"Experience with {', '.join(skills[:5])} and related projects.",
+            f"Built solutions using {', '.join(skills)}.",
+            f"Hands-on {role.lower()} background with {', '.join(skills[:6])}.",
+        ]
+
+        for text in templates:
+            train_texts.append(text)
+            train_labels.append(role)
+
+    vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
+    features = vectorizer.fit_transform(train_texts)
+    classifier = LogisticRegression(max_iter=1000, class_weight="balanced")
+    classifier.fit(features, train_labels)
+    return vectorizer, classifier
+
+
 def score_resume(resume_text: str) -> pd.DataFrame:
     role_names = list(JOB_ROLES.keys())
     role_docs = [JOB_ROLES[role]["description"] for role in role_names]
@@ -81,18 +111,29 @@ def score_resume(resume_text: str) -> pd.DataFrame:
 
     vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
     matrix = vectorizer.fit_transform(docs)
-    similarities = cosine_similarity(matrix[0:1], matrix[1:]).flatten()
+    similarities = cosine_similarity(matrix.getrow(0), matrix).flatten()[1:]
+
+    ml_prob_by_role: Dict[str, float] = {role: 0.0 for role in role_names}
+    try:
+        clf_vectorizer, classifier = get_role_classifier()
+        probs = classifier.predict_proba(clf_vectorizer.transform([resume_text]))[0]
+        ml_prob_by_role = {role: float(prob) for role, prob in zip(classifier.classes_, probs)}
+    except Exception:
+        # If the classifier cannot run for any reason, keep deterministic fallback scores.
+        pass
 
     rows = []
     for role, similarity in zip(role_names, similarities):
-        required_skills = JOB_ROLES[role]["skills"]
+        required_skills = cast(List[str], JOB_ROLES[role]["skills"])
         matched_skills = extract_skills(resume_text, required_skills)
         missing_skills = [s for s in required_skills if s not in matched_skills]
         skill_score = len(matched_skills) / len(required_skills)
-        final_score = round((0.65 * similarity + 0.35 * skill_score) * 100, 1)
+        ml_confidence = ml_prob_by_role.get(role, 0.0)
+        final_score = round((0.5 * similarity + 0.25 * skill_score + 0.25 * ml_confidence) * 100, 1)
         rows.append({
             "Job Role": role,
             "Match Score": final_score,
+            "ML Confidence": round(ml_confidence * 100, 1),
             "Matched Skills": ", ".join(matched_skills) if matched_skills else "None found",
             "Missing Skills": ", ".join(missing_skills[:6]) if missing_skills else "None",
         })
@@ -111,7 +152,7 @@ def resume_feedback(resume_text: str, best_role: str) -> List[str]:
     if not any(verb in cleaned for verb in ACTION_VERBS):
         feedback.append("Start bullet points with stronger action verbs like built, analyzed, automated, optimized, or deployed.")
 
-    role_skills = JOB_ROLES[best_role]["skills"]
+    role_skills = cast(List[str], JOB_ROLES[best_role]["skills"])
     missing = [s for s in role_skills if s not in extract_skills(resume_text, role_skills)]
     if missing:
         feedback.append(f"For {best_role}, consider adding or learning: {', '.join(missing[:5])}.")
@@ -373,11 +414,11 @@ def fetch_hackernews_jobs(search_query: str, limit: int = 20) -> Tuple[List[Dict
     return normalized_jobs, ""
 
 
-def rank_live_jobs(resume_text: str, jobs: List[Dict[str, str]]) -> pd.DataFrame:
+def rank_live_jobs(resume_text: str, jobs: List[Dict[str, str]], target_role: str = "") -> pd.DataFrame:
     if not jobs:
         return pd.DataFrame()
 
-    all_skills = sorted({skill for role in JOB_ROLES.values() for skill in role["skills"]})
+    all_skills = sorted({skill for role in JOB_ROLES.values() for skill in cast(List[str], role["skills"])})
     resume_skills = set(extract_skills(resume_text, all_skills))
 
     role_docs = []
@@ -390,13 +431,30 @@ def rank_live_jobs(resume_text: str, jobs: List[Dict[str, str]]) -> pd.DataFrame
     try:
         vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
         matrix = vectorizer.fit_transform(docs)
-        similarities = cosine_similarity(matrix[0:1], matrix[1:]).flatten()
+        similarities = cosine_similarity(matrix.getrow(0), matrix).flatten()[1:]
     except ValueError:
         # Fallback when all docs collapse to empty vocabulary after cleaning.
         similarities = [0.0] * len(jobs)
 
+    resume_role_probs: Dict[str, float] = {role: 0.0 for role in JOB_ROLES.keys()}
+    job_role_probs_list: List[Dict[str, float]] = [{role: 0.0 for role in JOB_ROLES.keys()} for _ in jobs]
+    try:
+        clf_vectorizer, classifier = get_role_classifier()
+        resume_probs = classifier.predict_proba(clf_vectorizer.transform([resume_text]))[0]
+        resume_role_probs = {role: float(prob) for role, prob in zip(classifier.classes_, resume_probs)}
+
+        job_input_texts = [f"{job.get('title', '')} {job.get('description', '')}" for job in jobs]
+        job_prob_vectors = classifier.predict_proba(clf_vectorizer.transform(job_input_texts))
+        job_role_probs_list = [
+            {role: float(prob) for role, prob in zip(classifier.classes_, probs)}
+            for probs in job_prob_vectors
+        ]
+    except Exception:
+        # Keep ranking deterministic even if classifier inference fails.
+        pass
+
     rows = []
-    for job, similarity in zip(jobs, similarities):
+    for job, similarity, job_role_probs in zip(jobs, similarities, job_role_probs_list):
         job_skill_targets = set(extract_skills(job.get("description", ""), all_skills))
         if job_skill_targets:
             matched = sorted(resume_skills.intersection(job_skill_targets))
@@ -406,13 +464,24 @@ def rank_live_jobs(resume_text: str, jobs: List[Dict[str, str]]) -> pd.DataFrame
             skill_score = 0.0
             matched_preview = "No common tracked skills found"
 
-        final_score = round((0.7 * similarity + 0.3 * skill_score) * 100, 1)
+        target_role_confidence = job_role_probs.get(target_role, 0.0) if target_role else 0.0
+        resume_vector = [resume_role_probs.get(role, 0.0) for role in JOB_ROLES.keys()]
+        job_vector = [job_role_probs.get(role, 0.0) for role in JOB_ROLES.keys()]
+        numerator = sum(a * b for a, b in zip(resume_vector, job_vector))
+        denominator = math.sqrt(sum(a * a for a in resume_vector)) * math.sqrt(sum(b * b for b in job_vector))
+        role_alignment = (numerator / denominator) if denominator else 0.0
+
+        final_score = round(
+            (0.55 * similarity + 0.2 * skill_score + 0.15 * target_role_confidence + 0.1 * role_alignment) * 100,
+            1,
+        )
         rows.append(
             {
                 "Match Score": final_score,
                 "Job Title": job.get("title", "Unknown Role"),
                 "Company": job.get("company", "Unknown Company"),
                 "Location": job.get("location", "Remote"),
+                "Role Fit": round(target_role_confidence * 100, 1),
                 "Matched Skills": matched_preview,
                 "Source": job.get("source", "API"),
                 "Apply Link": job.get("apply_url", ""),
@@ -488,7 +557,7 @@ st.write("Paste or upload resume text to predict suitable job roles and get impr
 
 with st.sidebar:
     st.header("Project Info")
-    st.write("ML used: TF-IDF vectorization + cosine similarity + rule-based skill extraction.")
+    st.write("ML used: TF-IDF + cosine similarity + Logistic Regression role classifier + rule-based skill extraction.")
     st.write("Group extension ideas: PDF parsing, live job listings, user accounts, BERT embeddings, dashboards.")
     selected_ocr_languages = st.multiselect(
         "OCR languages for scanned PDFs",
@@ -524,7 +593,7 @@ if st.button("Analyze Resume", type="primary"):
         results = score_resume(resume_text)
         best_role = results.iloc[0]["Job Role"]
         suggestions = resume_feedback(resume_text, best_role)
-        all_skills = [skill for role in JOB_ROLES.values() for skill in role["skills"]]
+        all_skills = [skill for role in JOB_ROLES.values() for skill in cast(List[str], role["skills"])]
         detected_skills = extract_skills(resume_text, all_skills)
 
         with st.spinner("Fetching current job listings and ranking best applications..."):
@@ -532,7 +601,7 @@ if st.button("Analyze Resume", type="primary"):
 
         ranked_jobs = pd.DataFrame()
         if not jobs_error:
-            ranked_jobs = rank_live_jobs(resume_text, live_jobs)
+            ranked_jobs = rank_live_jobs(resume_text, live_jobs, target_role=best_role)
 
         st.session_state["analysis_ready"] = True
         st.session_state["analysis_results"] = results
@@ -569,6 +638,7 @@ if st.session_state.get("analysis_ready", False):
 
     st.subheader("Live Job Recommendations")
     st.caption("Pulled from public APIs: Remotive, Arbeitnow, RemoteOK, and Hacker News Jobs")
+    st.caption("Ranking uses role-aware ML (text similarity + skill overlap + role fit).")
 
     if jobs_error:
         st.info(jobs_error)

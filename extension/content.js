@@ -93,7 +93,6 @@ const FIELD_MATCHERS = [
 ];
 
 const INJECTED_STYLE_ID = "jma-style";
-const OPEN_BUTTON_ID = "jma-open-button";
 const PANEL_ID = "jma-panel";
 
 const SITE_PRESETS = {
@@ -378,27 +377,10 @@ function addStyles() {
   const style = document.createElement("style");
   style.id = INJECTED_STYLE_ID;
   style.textContent = `
-    #${OPEN_BUTTON_ID} {
-      position: fixed;
-      right: 20px;
-      bottom: 20px;
-      z-index: 2147483645;
-      border: 0;
-      border-radius: 999px;
-      padding: 10px 14px;
-      font-size: 13px;
-      font-weight: 600;
-      letter-spacing: 0.2px;
-      color: #ffffff;
-      background: linear-gradient(135deg, #005bbf, #007d9c);
-      box-shadow: 0 10px 26px rgba(0, 55, 110, 0.25);
-      cursor: pointer;
-    }
-
     #${PANEL_ID} {
       position: fixed;
       right: 20px;
-      bottom: 72px;
+      bottom: 20px;
       width: 400px;
       max-height: 80vh;
       overflow: auto;
@@ -446,20 +428,6 @@ function addStyles() {
 
 function ensureWidget() {
   addStyles();
-
-  if (!document.getElementById(OPEN_BUTTON_ID)) {
-    const openButton = document.createElement("button");
-    openButton.id = OPEN_BUTTON_ID;
-    openButton.type = "button";
-    openButton.textContent = "Analyze this job";
-    openButton.addEventListener("click", () => {
-      const panel = document.getElementById(PANEL_ID);
-      if (panel) {
-        panel.classList.toggle("jma-hidden");
-      }
-    });
-    document.body.appendChild(openButton);
-  }
 
   if (!document.getElementById(PANEL_ID)) {
     const panel = document.createElement("section");
