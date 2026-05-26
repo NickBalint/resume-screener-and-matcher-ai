@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Candidate Profile</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main class="page">
+      <h1>Candidate Profile</h1>
+      <p class="hint">This data powers job analysis, tailored drafts, and form autofill.</p>
+
+      <form id="profileForm">
+        <label>Full name<input name="fullName" type="text" /></label>
+        <label>Email<input name="email" type="email" /></label>
+        <label>Phone<input name="phone" type="text" /></label>
+        <label>Location<input name="location" type="text" /></label>
+        <label>LinkedIn URL<input name="linkedin" type="url" /></label>
+        <label>GitHub URL<input name="github" type="url" /></label>
+        <label>Portfolio URL<input name="website" type="url" /></label>
+        <label>Years of experience<input name="yearsExperience" type="text" /></label>
+
+        <label>
+          Cover letter tone
+          <select name="defaultCoverLetterTone">
+            <option value="professional">Professional</option>
+            <option value="confident">Confident</option>
+            <option value="concise">Concise</option>
+          </select>
+        </label>
+
+        <label>
+          Resume master text
+          <textarea name="resumeText" rows="9" placeholder="Paste your base resume text"></textarea>
+        </label>
+
+        <button type="submit">Save Profile</button>
+      </form>
+
+      <p id="status" class="status"></p>
+    </main>
+    <script src="options.js"></script>
+  </body>
+</html>

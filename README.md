@@ -26,6 +26,48 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Chrome Extension (Realistic Apply Assistant)
+
+This repo now includes a Chrome extension in `extension/` for the realistic workflow:
+
+- Analyze this job on LinkedIn, Indeed, and company career pages
+- Generate tailored resume bullets and a cover letter draft per posting
+- Autofill common application fields using your saved profile
+
+Extraction presets are included for:
+
+- LinkedIn
+- Indeed
+- Greenhouse
+- Lever
+
+If a page structure does not match a known preset, the extension falls back to a generic extractor.
+
+### Load the Extension in Chrome
+
+1. Open `chrome://extensions`
+2. Enable **Developer mode** (top right)
+3. Click **Load unpacked**
+4. Select the `extension/` folder from this repo
+
+### Set Up Your Candidate Profile
+
+1. Click the extension icon
+2. Open **Edit Candidate Profile**
+3. Save your name, email, phone, links, and resume master text
+
+### Use on Job Pages
+
+1. Open a job posting on LinkedIn, Indeed, or a company careers page
+2. Click the floating **Analyze this job** button (bottom-right) or use the popup
+3. Review top role match, tailored bullets, and generated cover letter
+4. Click **Autofill Form** to fill common fields (name, email, phone, links, summary)
+
+### Notes
+
+- This is an assisted workflow: you still review and submit manually.
+- Autofill reliability varies by ATS/site markup.
+
 ### OCR Setup for Scanned PDFs
 
 For image-only PDFs, install Tesseract OCR on your machine:
